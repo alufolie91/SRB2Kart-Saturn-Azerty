@@ -45,6 +45,7 @@ extern unsigned msaa;
 extern boolean a2c;
 
 extern FTransform atransform;
+extern float gr_viewsin, gr_viewcos;
 
 // Performance stats
 extern ps_metric_t ps_hw_nodesorttime;
@@ -96,6 +97,9 @@ void HWR_Lighting(FSurfaceInfo *Surface, INT32 light_level, extracolormap_t *col
 UINT8 HWR_FogBlockAlpha(INT32 light, extracolormap_t *colormap); // Let's see if this can work
 
 FBITFIELD HWR_TranstableToAlpha(INT32 transtablenum, FSurfaceInfo *pSurf);
+
+// Get amount of memory used by gpu textures in bytes
+INT32 HWR_GetTextureUsed(void);
 
 // hw_main.c: Post-rendering
 void HWR_DoPostProcessor(player_t *player);
