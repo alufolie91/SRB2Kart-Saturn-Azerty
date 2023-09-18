@@ -30,6 +30,7 @@
 #include "../r_fps.h"
 #include "../r_state.h"
 #include "../r_local.h"
+#include "../r_data.h"
 #include "../r_patch.h" // a mystery as to what this is for
 #include "../r_bsp.h"	// R_NoEncore
 #include "../r_main.h"	// cv_fov
@@ -60,10 +61,14 @@ struct hwdriver_s hwdriver;
 // Commands and console variables
 // ==========================================================================
 
+// keep the state here instead of in the cv var, so it always matches the state in r_opengl.c
+int gr_use_palette_shader = 0;
+
 static void CV_filtermode_ONChange(void);
 static void CV_anisotropic_ONChange(void);
 static void CV_screentextures_ONChange(void);
-static void CV_useCustomShaders_ONChange(void);
+static void CV_useCustomShaders_ONChange(void); 
+static void CV_grpaletteshader_OnChange(void);
 
 static CV_PossibleValue_t grfiltermode_cons_t[]= {{HWD_SET_TEXTUREFILTER_POINTSAMPLED, "Nearest"},
 	{HWD_SET_TEXTUREFILTER_BILINEAR, "Bilinear"}, {HWD_SET_TEXTUREFILTER_TRILINEAR, "Trilinear"},
@@ -115,7 +120,11 @@ static INT32 current_bsp_culling_distance = 0;
 consvar_t cv_grscreentextures = {"gr_screentextures", "On", CV_CALL, CV_OnOff,
                                  CV_screentextures_ONChange, 0, NULL, NULL, 0, 0, NULL};
 
- consvar_t cv_grusecustomshaders = {"gr_usecustomshaders", "Yes", CV_CALL|CV_SAVE, CV_OnOff, CV_useCustomShaders_ONChange, 0, NULL, NULL, 0, 0, NULL};
+consvar_t cv_grusecustomshaders = {"gr_usecustomshaders", "Yes", CV_CALL|CV_SAVE, CV_OnOff, CV_useCustomShaders_ONChange, 0, NULL, NULL, 0, 0, NULL};
+
+consvar_t cv_grpaletteshader = {"gr_paletteshader", "Off", CV_CALL|CV_SAVE, CV_OnOff, CV_grpaletteshader_OnChange, 0, NULL, NULL, 0, 0, NULL};
+
+consvar_t cv_grflashpal = {"gr_flashpal", "On", 0, CV_OnOff, NULL, 0, NULL, NULL, 0, 0, NULL};
 
 static void CV_filtermode_ONChange(void)
 {
@@ -136,6 +145,16 @@ static void CV_useCustomShaders_ONChange(void)
 {
     if (rendermode == render_opengl)
         HWD.pfnInitCustomShaders();
+}
+
+static void CV_grpaletteshader_OnChange(void)
+{
+	if (rendermode == render_opengl)
+	{
+		HWD.pfnSetSpecialState(HWD_SET_PALETTE_SHADER_ENABLED, cv_grpaletteshader.value);
+		gr_use_palette_shader = cv_grpaletteshader.value;
+		V_SetPalette(0);
+	}
 }
 
 // ==========================================================================
@@ -400,6 +419,7 @@ static size_t gr_numportalcullsectors = 0;
 void HWR_Lighting(FSurfaceInfo *Surface, INT32 light_level, extracolormap_t *colormap)
 {
 	RGBA_t poly_color, tint_color, fade_color;
+	boolean default_colormap = false;
 
 	poly_color.rgba = 0xFFFFFFFF;
 	tint_color.rgba = (colormap != NULL) ? (UINT32)colormap->rgba : GL_DEFAULTMIX;
@@ -451,6 +471,37 @@ void HWR_Lighting(FSurfaceInfo *Surface, INT32 light_level, extracolormap_t *col
 	Surface->LightInfo.light_level = light_level;
 	Surface->LightInfo.fade_start = (colormap != NULL) ? colormap->fadestart : 0;
 	Surface->LightInfo.fade_end = (colormap != NULL) ? colormap->fadeend : 31;
+	
+	if (gr_use_palette_shader)
+	{
+		if (!colormap)
+		{
+			colormap = &extra_colormaps[num_extra_colormaps];
+			default_colormap = true;
+		}
+		if (!colormap->gl_lighttable_id)
+			{
+			UINT8 *colormap_pointer;
+
+			if (default_colormap)
+			{
+				colormap_pointer = colormaps;
+			}
+			else
+			{
+				colormap_pointer = colormap->colormap;
+			}
+			colormap->gl_lighttable_id = HWD.pfnAddLightTable(colormap_pointer);
+		}
+
+		Surface->LightTableId = colormap->gl_lighttable_id;
+	}
+}
+
+void HWR_ClearLightTableCache()
+{
+	if (rendermode == render_opengl)
+		HWD.pfnClearLightTableCache();
 }
 
 UINT8 HWR_FogBlockAlpha(INT32 light, extracolormap_t *colormap) // Let's see if this can work
@@ -723,9 +774,82 @@ void HWR_RenderPlane(extrasubsector_t *xsub, boolean isceiling, fixed_t fixedhei
 	else if (PolyFlags & PF_Ripple)
 		HWD.pfnSetShader(5);	// water shader
 	else
-		HWD.pfnSetShader(1);	// floor shader
+		HWD.pfnSetShader(gr_use_palette_shader ? 9 : 1);	// floor shader
 
-	HWD.pfnDrawPolygon(&Surf, planeVerts, nrPlaneVerts, PolyFlags);
+	HWD.pfnDrawPolygon(&Surf, planeVerts, nrPlaneVerts, PolyFlags, false);
+
+	if (subsector)
+	{
+		// Horizon lines
+		FOutVector horizonpts[6];
+		float dist, vx, vy;
+		float x1, y1, xd, yd;
+		UINT8 numplanes, j;
+		vertex_t v; // For determining the closest distance from the line to the camera, to split render planes for minimum distortion;
+
+		const float renderdist = 27000.0f; // How far out to properly render the plane
+		const float farrenderdist = 32768.0f; // From here, raise plane to horizon level to fill in the line with some texture distortion
+
+		seg_t *line = &segs[subsector->firstline];
+
+		for (i = 0; i < subsector->numlines; i++, line++)
+		{
+			if (line->linedef->special == 41 && R_PointOnSegSide(dup_viewx, dup_viewy, line) == 0)
+			{
+				P_ClosestPointOnLine(viewx, viewy, line->linedef, &v);
+				dist = FIXED_TO_FLOAT(R_PointToDist(v.x, v.y));
+
+				x1 = ((polyvertex_t *)line->pv1)->x;
+				y1 = ((polyvertex_t *)line->pv1)->y;
+				xd = ((polyvertex_t *)line->pv2)->x - x1;
+				yd = ((polyvertex_t *)line->pv2)->y - y1;
+
+				// Based on the seg length and the distance from the line, split horizon into multiple poly sets to reduce distortion
+				dist = sqrtf((xd*xd) + (yd*yd)) / dist / 16.0f;
+				if (dist > 100.0f)
+					numplanes = 100;
+				else
+					numplanes = (UINT8)dist + 1;
+
+				for (j = 0; j < numplanes; j++)
+				{
+					// Left side
+					vx = x1 + xd * j / numplanes;
+					vy = y1 + yd * j / numplanes;
+					SETUP3DVERT((&horizonpts[1]), vx, vy);
+
+					dist = sqrtf(powf(vx - gr_viewx, 2) + powf(vy - gr_viewy, 2));
+					vx = (vx - gr_viewx) * renderdist / dist + gr_viewx;
+					vy = (vy - gr_viewy) * renderdist / dist + gr_viewy;
+					SETUP3DVERT((&horizonpts[0]), vx, vy);
+
+					// Right side
+					vx = x1 + xd * (j+1) / numplanes;
+					vy = y1 + yd * (j+1) / numplanes;
+					SETUP3DVERT((&horizonpts[2]), vx, vy);
+
+					dist = sqrtf(powf(vx - gr_viewx, 2) + powf(vy - gr_viewy, 2));
+					vx = (vx - gr_viewx) * renderdist / dist + gr_viewx;
+					vy = (vy - gr_viewy) * renderdist / dist + gr_viewy;
+					SETUP3DVERT((&horizonpts[3]), vx, vy);
+
+					// Horizon fills
+					vx = (horizonpts[0].x - gr_viewx) * farrenderdist / renderdist + gr_viewx;
+					vy = (horizonpts[0].z - gr_viewy) * farrenderdist / renderdist + gr_viewy;
+					SETUP3DVERT((&horizonpts[5]), vx, vy);
+					horizonpts[5].y = gr_viewz;
+
+					vx = (horizonpts[3].x - gr_viewx) * farrenderdist / renderdist + gr_viewx;
+					vy = (horizonpts[3].z - gr_viewy) * farrenderdist / renderdist + gr_viewy;
+					SETUP3DVERT((&horizonpts[4]), vx, vy);
+					horizonpts[4].y = gr_viewz;
+
+					// Draw
+					HWD.pfnDrawPolygon(&Surf, horizonpts, 6, PolyFlags, true);
+				}
+			}
+		}
+	}
 }
 
 #ifdef WALLSPLATS
@@ -788,8 +912,8 @@ static void HWR_DrawSegsSplats(FSurfaceInfo * pSurf)
 				break;
 		}
 
-		HWD.pfnSetShader(2);	// wall shader
-		HWD.pfnDrawPolygon(&pSurf, wallVerts, 4, i|PF_Modulated|PF_Decal);
+		HWD.pfnSetShader(gr_use_palette_shader ? 10 : 2);	// wall shader
+		HWD.pfnDrawPolygon(&pSurf, wallVerts, 4, i|PF_Modulated|PF_Decal, false);
 	}
 }
 #endif
@@ -822,7 +946,7 @@ void HWR_ProjectWall(FOutVector *wallVerts, FSurfaceInfo *pSurf, FBITFIELD blend
 {
 	HWR_Lighting(pSurf, lightlevel, wallcolormap);
 
-	HWD.pfnSetShader(2);	// wall shader
+	HWD.pfnSetShader(gr_use_palette_shader ? 10 : 2);	// wall shader
 
 	// don't draw to color buffer when drawing to stencil
 	if (gl_drawing_stencil)
@@ -831,7 +955,7 @@ void HWR_ProjectWall(FOutVector *wallVerts, FSurfaceInfo *pSurf, FBITFIELD blend
 		blendmode &= ~PF_Masked;
 	}
 
-	HWD.pfnDrawPolygon(pSurf, wallVerts, 4, blendmode|PF_Modulated|PF_Occlude);
+	HWD.pfnDrawPolygon(pSurf, wallVerts, 4, blendmode|PF_Modulated|PF_Occlude, false);
 
 #ifdef WALLSPLATS
 	if (gr_curline->linedef->splats && cv_splats.value)
@@ -904,13 +1028,15 @@ void HWR_SplitWall(sector_t *sector, FOutVector *wallVerts, INT32 texnum, FSurfa
 		{
 			if (pfloor && (pfloor->flags & FF_FOG))
 			{
-				lightnum = HWR_CalcWallLight(pfloor->master->frontsector->lightlevel, v1x, v1y, v2x, v2y);
 				colormap = pfloor->master->frontsector->extra_colormap;
+				lightnum = pfloor->master->frontsector->lightlevel;
+				lightnum = colormap ? lightnum : HWR_CalcWallLight(lightnum, v1x, v1y, v2x, v2y);
 			}
 			else
 			{
-				lightnum = HWR_CalcWallLight(*list[i].lightlevel, v1x, v1y, v2x, v2y);
 				colormap = list[i].extra_colormap;
+				lightnum = *list[i].lightlevel;
+				lightnum = colormap ? lightnum : HWR_CalcWallLight(lightnum, v1x, v1y, v2x, v2y);
 			}
 		}
 
@@ -1001,9 +1127,22 @@ void HWR_SplitWall(sector_t *sector, FOutVector *wallVerts, INT32 texnum, FSurfa
 		}
 #endif
 
-		// Found a break
-		bot = min(max(bheight, realbot), top);
+#ifdef ESLOPE
+		if (endbheight > endtop)
+			endbot = endtop;
+#endif
+		if (bheight >= top)
+			continue;
+
+		//Found a break;
+		bot = bheight;
+
+		if (bot < realbot)
+			bot = realbot;
+		
+#ifdef ESLOPE
 		endbot = min(max(endbheight, endrealbot), endtop);
+#endif
 
 		Surf->PolyColor.s.alpha = alpha;
 
@@ -1125,7 +1264,7 @@ void HWR_DrawSkyWallList()
 	HWD.pfnUnSetShader();
 	for (i = 0; i < skyWallVertexArraySize; i++)
 	{
-		HWD.pfnDrawPolygon(&surf, skyWallVertexArray + i * 4, 4, PF_Occlude|PF_Invisible|PF_NoTexture);
+		HWD.pfnDrawPolygon(&surf, skyWallVertexArray + i * 4, 4, PF_Occlude|PF_Invisible|PF_NoTexture, false);
 	}
 }
 
@@ -1297,8 +1436,9 @@ void HWR_ProcessSeg(void) // Sort of like GLWall::Process in GZDoom
 		cliphigh = (float)(texturehpeg + (gr_curline->flength*FRACUNIT));
 	}
 
-	lightnum = HWR_CalcWallLight(gr_frontsector->lightlevel, vs.x, vs.y, ve.x, ve.y);
 	colormap = gr_frontsector->extra_colormap;
+	lightnum = gr_frontsector->lightlevel;
+	lightnum = colormap ? lightnum : HWR_CalcWallLight(lightnum, vs.x, vs.y, ve.x, ve.y);
 
 	if (gr_frontsector)
 		Surf.PolyColor.s.alpha = 255;
@@ -2119,8 +2259,10 @@ void HWR_ProcessSeg(void) // Sort of like GLWall::Process in GZDoom
 
 					blendmode = PF_Fog|PF_NoTexture;
 
-					lightnum = HWR_CalcWallLight(rover->master->frontsector->lightlevel, vs.x, vs.y, ve.x, ve.y);
 					colormap = rover->master->frontsector->extra_colormap;
+					lightnum = rover->master->frontsector->lightlevel;
+					lightnum = colormap ? lightnum : HWR_CalcWallLight(lightnum, vs.x, vs.y, ve.x, ve.y);
+
 
 					Surf.PolyColor.s.alpha = HWR_FogBlockAlpha(rover->master->frontsector->lightlevel, rover->master->frontsector->extra_colormap);
 
@@ -2242,8 +2384,9 @@ void HWR_ProcessSeg(void) // Sort of like GLWall::Process in GZDoom
 
 					blendmode = PF_Fog|PF_NoTexture;
 
-					lightnum = HWR_CalcWallLight(rover->master->frontsector->lightlevel, vs.x, vs.y, ve.x, ve.y);
 					colormap = rover->master->frontsector->extra_colormap;
+					lightnum = rover->master->frontsector->lightlevel;
+					lightnum = colormap ? lightnum : HWR_CalcWallLight(lightnum, vs.x, vs.y, ve.x, ve.y);
 
 					Surf.PolyColor.s.alpha = HWR_FogBlockAlpha(rover->master->frontsector->lightlevel, rover->master->frontsector->extra_colormap);
 
@@ -2950,8 +3093,8 @@ void HWR_RenderPolyObjectPlane(polyobj_t *polysector, boolean isceiling, fixed_t
 	else
 		blendmode |= PF_Masked|PF_Modulated;
 
-	HWD.pfnSetShader(1);	// floor shader
-	HWD.pfnDrawPolygon(&Surf, planeVerts, nrPlaneVerts, blendmode);
+	HWD.pfnSetShader(gr_use_palette_shader ? 9 : 1);	// floor shader
+	HWD.pfnDrawPolygon(&Surf, planeVerts, nrPlaneVerts, blendmode, false);
 }
 
 void HWR_AddPolyObjectPlanes(void)
@@ -3749,8 +3892,8 @@ static void HWR_DrawSpriteShadow(gr_vissprite_t *spr, GLPatch_t *gpatch, float t
 	if (sSurf.PolyColor.s.alpha > floorheight/4)
 	{
 		sSurf.PolyColor.s.alpha = (UINT8)(sSurf.PolyColor.s.alpha - floorheight/4);
-		HWD.pfnSetShader(1);	// floor shader
-		HWD.pfnDrawPolygon(&sSurf, swallVerts, 4, PF_Translucent|PF_Modulated);
+		HWD.pfnSetShader(gr_use_palette_shader ? 9 : 1);	// floor shader
+		HWD.pfnDrawPolygon(&sSurf, swallVerts, 4, PF_Translucent|PF_Modulated, false);
 	}
 }
 
@@ -3825,7 +3968,7 @@ static void HWR_SplitSprite(gr_vissprite_t *spr)
 	FOutVector baseWallVerts[4]; // This is what the verts should end up as
 	GLPatch_t *gpatch;
 	FSurfaceInfo Surf;
-	const boolean hires = (spr->mobj && spr->mobj->skin && ((skin_t *)spr->mobj->skin)->flags & SF_HIRES);
+	const boolean hires = (spr->mobj && spr->mobj->skin && ((skin_t *)( (spr->mobj->localskin) ? spr->mobj->localskin : spr->mobj->skin ))->flags & SF_HIRES);
 	extracolormap_t *colormap;
 	FUINT lightlevel;
 	FBITFIELD blend = 0;
@@ -3849,7 +3992,7 @@ static void HWR_SplitSprite(gr_vissprite_t *spr)
 	this_scale = FIXED_TO_FLOAT(spr->mobj->scale);
 
 	if (hires)
-		this_scale = this_scale * FIXED_TO_FLOAT(((skin_t *)spr->mobj->skin)->highresscale);
+		this_scale = this_scale * FIXED_TO_FLOAT(((skin_t *)( (spr->mobj->localskin) ? spr->mobj->localskin : spr->mobj->skin ))->highresscale);
 
 	gpatch = spr->gpatch; //W_CachePatchNum(spr->patchlumpnum, PU_CACHE);
 
@@ -4116,8 +4259,8 @@ static void HWR_SplitSprite(gr_vissprite_t *spr)
 
 		Surf.PolyColor.s.alpha = alpha;
 
-		HWD.pfnSetShader(3);	// sprite shader
-		HWD.pfnDrawPolygon(&Surf, wallVerts, 4, blend|PF_Modulated);
+		HWD.pfnSetShader(gr_use_palette_shader ? 10 : 3);	// sprite shader
+		HWD.pfnDrawPolygon(&Surf, wallVerts, 4, blend|PF_Modulated, false);
 
 		top = bot;
 #ifdef ESLOPE
@@ -4156,8 +4299,8 @@ static void HWR_SplitSprite(gr_vissprite_t *spr)
 
 	Surf.PolyColor.s.alpha = alpha;
 
-	HWD.pfnSetShader(3);	// sprite shader
-	HWD.pfnDrawPolygon(&Surf, wallVerts, 4, blend|PF_Modulated);
+	HWD.pfnSetShader(gr_use_palette_shader ? 10 : 3);	// sprite shader
+	HWD.pfnDrawPolygon(&Surf, wallVerts, 4, blend|PF_Modulated, false);
 }
 
 // -----------------+
@@ -4171,11 +4314,11 @@ static void HWR_DrawSprite(gr_vissprite_t *spr)
 	FOutVector wallVerts[4];
 	GLPatch_t *gpatch; // sprite patch converted to hardware
 	FSurfaceInfo Surf;
-	const boolean hires = (spr->mobj && spr->mobj->skin && ((skin_t *)spr->mobj->skin)->flags & SF_HIRES);
+	const boolean hires = (spr->mobj && spr->mobj->skin && ((skin_t *)( (spr->mobj->localskin) ? spr->mobj->localskin : spr->mobj->skin ))->flags & SF_HIRES);
 	if (spr->mobj)
 		this_scale = FIXED_TO_FLOAT(spr->mobj->scale);
 	if (hires)
-		this_scale = this_scale * FIXED_TO_FLOAT(((skin_t *)spr->mobj->skin)->highresscale);
+		this_scale = this_scale * FIXED_TO_FLOAT(((skin_t *)( (spr->mobj->localskin) ? spr->mobj->localskin : spr->mobj->skin ))->highresscale);
 
 	if (!spr->mobj)
 		return;
@@ -4309,8 +4452,8 @@ static void HWR_DrawSprite(gr_vissprite_t *spr)
 			blend = PF_Translucent|PF_Occlude;
 		}
 
-		HWD.pfnSetShader(3);	// sprite shader
-		HWD.pfnDrawPolygon(&Surf, wallVerts, 4, blend|PF_Modulated);
+		HWD.pfnSetShader(gr_use_palette_shader ? 10 : 3);	// sprite shader
+		HWD.pfnDrawPolygon(&Surf, wallVerts, 4, blend|PF_Modulated, false);
 	}
 }
 
@@ -4403,8 +4546,8 @@ static inline void HWR_DrawPrecipitationSprite(gr_vissprite_t *spr)
 		blend = PF_Translucent|PF_Occlude;
 	}
 
-	HWD.pfnSetShader(3);	// sprite shader
-	HWD.pfnDrawPolygon(&Surf, wallVerts, 4, blend|PF_Modulated);
+	HWD.pfnSetShader(gr_use_palette_shader ? 10 : 3);	// sprite shader
+	HWD.pfnDrawPolygon(&Surf, wallVerts, 4, blend|PF_Modulated, false);
 }
 
 // --------------------------------------------------------------------------
@@ -4722,8 +4865,19 @@ void HWR_DrawSprites(void)
 		else
 			if (spr->mobj && spr->mobj->skin && spr->mobj->sprite == SPR_PLAY)
 			{
+				md2_t *md2;
+				if (spr->mobj->localskin)
+				{
+					if (spr->mobj->skinlocal)
+						md2 = &md2_localplayermodels[(skin_t *)spr->mobj->localskin - localskins];
+					else
+						md2 = &md2_playermodels     [(skin_t *)spr->mobj->localskin -      skins];
+				}
+				else
+					md2 = &md2_playermodels[(skin_t *)spr->mobj->skin - skins];
+
 				// 8/1/19: Only don't display player models if no default SPR_PLAY is found.
-				if (!cv_grmdls.value || ((md2_playermodels[(skin_t*)spr->mobj->skin-skins].notfound || md2_playermodels[(skin_t*)spr->mobj->skin-skins].scale < 0.0f) && ((!cv_grfallbackplayermodel.value) || md2_models[SPR_PLAY].notfound || md2_models[SPR_PLAY].scale < 0.0f)) || spr->mobj->state == &states[S_PLAY_SIGN])
+				if (!cv_grmdls.value || ((md2->notfound || md2->scale < 0.0f) && ((!cv_grfallbackplayermodel.value) || md2_models[SPR_PLAY].notfound || md2_models[SPR_PLAY].scale < 0.0f)) || spr->mobj->state == &states[S_PLAY_SIGN])
 					HWR_DrawSprite(spr);
 				else
 					HWR_DrawMD2(spr);
@@ -4970,7 +5124,7 @@ void HWR_ProjectSprite(mobj_t *thing)
 	//Fab : 02-08-98: 'skin' override spritedef currently used for skin
 	if (thing->skin && thing->sprite == SPR_PLAY)
 	{
-		sprdef = &((skin_t *)thing->skin)->spritedef;
+		sprdef = &((skin_t *)( (thing->localskin) ? thing->localskin : thing->skin ))->spritedef;
 #ifdef ROTSPRITE
 		sprinfo = &spriteinfo[thing->sprite];
 #endif
@@ -5045,8 +5199,8 @@ void HWR_ProjectSprite(mobj_t *thing)
 		}
 	}
 
-	if (thing->skin && ((skin_t *)thing->skin)->flags & SF_HIRES)
-		this_scale = this_scale * FIXED_TO_FLOAT(((skin_t *)thing->skin)->highresscale);
+	if (thing->skin && ((skin_t *)( (thing->localskin) ? thing->localskin : thing->skin ))->flags & SF_HIRES)
+		this_scale = this_scale * FIXED_TO_FLOAT(((skin_t *)( (thing->localskin) ? thing->localskin : thing->skin ))->highresscale);
 
 	spr_width = spritecachedinfo[lumpoff].width;
 	spr_height = spritecachedinfo[lumpoff].height;
@@ -5065,7 +5219,7 @@ void HWR_ProjectSprite(mobj_t *thing)
 			rollsum = (thing->rollangle)+(thing->sloperoll);
 
 		rollangle = R_GetRollAngle(rollsum);
-		rotsprite = Patch_GetRotatedSprite(sprframe, (thing->frame & FF_FRAMEMASK), rot, flip, sprinfo, rollangle);
+		rotsprite = Patch_GetRotatedSprite(sprframe, (thing->frame & FF_FRAMEMASK), rot, flip, false, sprinfo, rollangle);
 
 		if (rotsprite != NULL)
 		{
@@ -5205,10 +5359,7 @@ void HWR_ProjectSprite(mobj_t *thing)
 		if (thing->colorized)
 			vis->colormap = R_GetTranslationColormap(TC_RAINBOW, thing->color, GTC_CACHE);
 		else if (thing->skin && thing->sprite == SPR_PLAY) // This thing is a player!
-		{
-			size_t skinnum = (skin_t*)thing->skin-skins;
-			vis->colormap = R_GetTranslationColormap((INT32)skinnum, thing->color, GTC_CACHE);
-		}
+			vis->colormap = R_GetLocalTranslationColormap(thing->skin, thing->localskin, thing->color, GTC_CACHE, thing->skinlocal);
 		else
 			vis->colormap = R_GetTranslationColormap(TC_DEFAULT, thing->color, GTC_CACHE);
 	}
@@ -5696,8 +5847,18 @@ void RecursivePortalRendering(portal_t *rootportal, const float fpov, player_t *
 			HWR_SetTransform(fpov, player);// restore transform
 		}
 		gr_collect_skywalls = false;
+		
+		ps_numsprites.value.i = gr_visspritecount;
+		PS_START_TIMING(ps_hw_spritesorttime);
 		HWR_SortVisSprites();
+		PS_STOP_TIMING(ps_hw_spritesorttime);
+		PS_START_TIMING(ps_hw_spritedrawtime);
 		HWR_DrawSprites();
+		PS_STOP_TIMING(ps_hw_spritedrawtime);
+
+		ps_numdrawnodes.value.i = 0;
+		ps_hw_nodesorttime.value.p = 0;
+		ps_hw_nodedrawtime.value.p = 0;
 		HWR_RenderDrawNodes();
 	}
 	// free memory from portal list allocated by calls to Add2Lines
@@ -5712,6 +5873,7 @@ void RecursivePortalRendering(portal_t *rootportal, const float fpov, player_t *
 	// TODO: batching at some point
 	// TODO: is it okay if stencil test is on all the time even when its not needed?
 }
+
 
 // ==========================================================================
 // Render the current frame.
@@ -5833,7 +5995,6 @@ void HWR_RenderFrame(INT32 viewnumber, player_t *player, boolean skybox)
 	HWD.pfnSetSpecialState(HWD_SET_SHADERS, cv_grshaders.value);
 	HWD.pfnSetShader(0);
 
-	//drawcount = 0;
 	validcount++;
 
 	portalclipline = NULL;
@@ -5871,18 +6032,8 @@ void HWR_RenderSinglePortal(portal_t *portal, size_t portalnum, float fpov, play
 	portalcullsector = gr_portalcullsectors[portalnum];
 	HWR_RenderBSPNode((INT32)numnodes - 1);
 
-	// Draw MD2 and sprites
-	ps_numsprites.value.i = gr_visspritecount;
-	PS_START_TIMING(ps_hw_spritesorttime);
 	HWR_SortVisSprites();
-	PS_STOP_TIMING(ps_hw_spritesorttime);
-	PS_START_TIMING(ps_hw_spritedrawtime);
 	HWR_DrawSprites();
-	PS_STOP_TIMING(ps_hw_spritedrawtime);
-
-	ps_numdrawnodes.value.i = 0;
-	ps_hw_nodesorttime.value.p = 0;
-	ps_hw_nodedrawtime.value.p = 0;
 	HWR_RenderDrawNodes();
 }
 
@@ -5951,6 +6102,8 @@ void HWR_AddCommands(void)
 	CV_RegisterVar(&cv_portalline);
 	CV_RegisterVar(&cv_portalonly);
 	CV_RegisterVar(&cv_secbright);
+	CV_RegisterVar(&cv_grpaletteshader);
+	CV_RegisterVar(&cv_grflashpal);
 }
 
 // --------------------------------------------------------------------------
@@ -5992,7 +6145,6 @@ void HWR_Startup(void)
 	}
 }
 
-
 // --------------------------------------------------------------------------
 // Free resources allocated by the hardware renderer
 // --------------------------------------------------------------------------
@@ -6014,8 +6166,6 @@ void HWR_RenderWall(FOutVector *wallVerts, FSurfaceInfo *pSurf, FBITFIELD blend,
 
 	pSurf->PolyColor.s.alpha = alpha; // put the alpha back after lighting
 
-	HWD.pfnSetShader(2);	// wall shader
-
 	if (blend & PF_Environment)
 		blendmode |= PF_Occlude;	// PF_Occlude must be used for solid objects
 
@@ -6027,7 +6177,9 @@ void HWR_RenderWall(FOutVector *wallVerts, FSurfaceInfo *pSurf, FBITFIELD blend,
 
 	blendmode |= PF_Modulated;	// No PF_Occlude means overlapping (incorrect) transparency
 
-	HWD.pfnDrawPolygon(pSurf, wallVerts, 4, blendmode);
+	if (!fogwall)
+		HWD.pfnSetShader(gr_use_palette_shader ? 10 : 2);	// wall shader
+	HWD.pfnDrawPolygon(pSurf, wallVerts, 4, blendmode, false);
 
 #ifdef WALLSPLATS
 	if (gr_curline->linedef->splats && cv_splats.value)
@@ -6058,7 +6210,7 @@ void HWR_DoPostProcessor(player_t *player)
 
 	// Armageddon Blast Flash!
 	// Could this even be considered postprocessor?
-	if (player->flashcount)
+	if (player->flashcount && !cv_grpaletteshader.value || player->flashcount && cv_grpaletteshader.value && !cv_grflashpal.value)
 	{
 		FOutVector      v[4];
 		FSurfaceInfo Surf;
@@ -6078,7 +6230,7 @@ void HWR_DoPostProcessor(player_t *player)
 
 		Surf.PolyColor.s.alpha = 0xc0; // match software mode
 
-		HWD.pfnDrawPolygon(&Surf, v, 4, PF_Modulated|PF_Translucent|PF_NoTexture|PF_NoDepthTest);
+		HWD.pfnDrawPolygon(&Surf, v, 4, PF_Modulated|PF_Translucent|PF_NoTexture|PF_NoDepthTest, false);
 	}
 
 	if (!cv_grscreentextures.value) // screen textures are needed for the rest of the effects
@@ -6187,6 +6339,8 @@ void HWR_MakeScreenFinalTexture(void)
 
 void HWR_DrawScreenFinalTexture(int width, int height)
 {
+	if (gr_use_palette_shader)
+		HWD.pfnSetShader(11);	//post processing
     HWD.pfnDrawScreenFinalTexture(width, height);
 }
 

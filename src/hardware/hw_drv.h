@@ -21,6 +21,7 @@
 #include "hw_md2.h"
 
 #include "hw_dll.h"
+#include "../doomdef.h"
 
 // ==========================================================================
 //                                                       STANDARD DLL EXPORTS
@@ -34,7 +35,7 @@ EXPORT void HWRAPI(SetPalette) (RGBA_t *ppal, RGBA_t *pgamma);
 #endif
 EXPORT void HWRAPI(FinishUpdate) (INT32 waitvbl);
 EXPORT void HWRAPI(Draw2DLine) (F2DCoord *v1, F2DCoord *v2, RGBA_t Color);
-EXPORT void HWRAPI(DrawPolygon) (FSurfaceInfo *pSurf, FOutVector *pOutVerts, FUINT iNumPts, FBITFIELD PolyFlags);
+EXPORT void HWRAPI(DrawPolygon) (FSurfaceInfo *pSurf, FOutVector *pOutVerts, FUINT iNumPts, FBITFIELD PolyFlags, boolean horizonSpecial);
 EXPORT void HWRAPI(SetBlend) (FBITFIELD PolyFlags);
 EXPORT void HWRAPI(ClearBuffer) (FBOOLEAN ColorMask, FBOOLEAN DepthMask, FBOOLEAN StencilMask, FRGBAFloat *ClearColor);
 EXPORT void HWRAPI(SetTexture) (FTextureInfo *TexInfo);
@@ -78,6 +79,9 @@ EXPORT void HWRAPI(InitCustomShaders) (void);
 
 EXPORT void HWRAPI(StartBatching) (void);
 EXPORT void HWRAPI(RenderBatches) (precise_t *sSortTime, precise_t *sDrawTime, int *sNumPolys, int *sNumVerts, int *sNumCalls, int *sNumShaders, int *sNumTextures, int *sNumPolyFlags, int *sNumColors);
+
+EXPORT UINT32 HWRAPI(AddLightTable) (UINT8 *lighttable);
+EXPORT void HWRAPI(ClearLightTableCache) (void);
 
 // ==========================================================================
 //                                      HWR DRIVER OBJECT, FOR CLIENT PROGRAM
@@ -125,6 +129,9 @@ struct hwdriver_s
 
 	StartBatching pfnStartBatching;
 	RenderBatches pfnRenderBatches;
+	
+	AddLightTable pfnAddLightTable;
+	ClearLightTableCache pfnClearLightTableCache;
 };
 
 extern struct hwdriver_s hwdriver;

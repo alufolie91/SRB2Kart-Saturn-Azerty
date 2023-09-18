@@ -59,6 +59,7 @@
 #endif
 
 #include "../doomstat.h"
+#include "../p_setup.h"
 #include "../i_system.h"
 #include "../v_video.h"
 #include "../m_argv.h"
@@ -1045,6 +1046,7 @@ static void Impl_HandleControllerButtonEvent(SDL_ControllerButtonEvent evt, Uint
 void I_GetEvent(void)
 {
 	SDL_Event evt;
+	char* dropped_filedir;
 	// We only want the first motion event,
 	// otherwise we'll end up catching the warp back to center.
 	//int mouseMotionOnce = 0;
@@ -1368,6 +1370,11 @@ void I_GetEvent(void)
 				// update the menu
 				if (currentMenu == &OP_JoystickSetDef)
 					M_SetupJoystickMenu(0);
+				break;
+			case SDL_DROPFILE:
+				dropped_filedir = evt.drop.file;
+				P_AddWadFile(dropped_filedir, false);
+				SDL_free(dropped_filedir);    // Free dropped_filedir memory
 				break;
 			case SDL_QUIT:
 				I_Quit();
@@ -2217,6 +2224,9 @@ void I_StartupGraphics(void)
 
 		HWD.pfnStartBatching = hwSym("StartBatching",NULL);
 		HWD.pfnRenderBatches = hwSym("RenderBatches",NULL);
+		
+		HWD.pfnAddLightTable = hwSym("AddLightTable",NULL);
+		HWD.pfnClearLightTableCache = hwSym("ClearLightTableCache",NULL);
 
 		if (!HWD.pfnInit()) // load the OpenGL library
 			rendermode = render_soft;
