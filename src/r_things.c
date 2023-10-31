@@ -130,7 +130,7 @@ static void R_InstallSpriteLump(UINT16 wad,            // graphics patch
 {
 	char cn = R_Frame2Char(frame); // for debugging
 
-	INT32 r, ang;
+	INT32 r;
 	lumpnum_t lumppat = wad;
 	lumppat <<= 16;
 	lumppat += lump;
@@ -828,9 +828,9 @@ static void R_DrawFlippedMaskedColumn(column_t *column, INT32 texheight)
 static void R_DrawVisSprite(vissprite_t *vis)
 {
 	column_t *column;
-	void (*localcolfunc)(column_t *);
+#ifdef RANGECHECK
 	INT32 texturecolumn;
-	INT32 pwidth;
+#endif
 	fixed_t frac;
 	patch_t *patch = vis->patch;
 	fixed_t this_scale = vis->thingscale;
@@ -951,7 +951,6 @@ static void R_DrawVisSprite(vissprite_t *vis)
 	if (!(vis->scalestep))
 	{
 		sprtopscreen = centeryfrac - FixedMul(dc_texturemid, spryscale);
-		//sprtopscreen += vis->shear.tan * vis->shear.offset;
 		dc_iscale = FixedDiv(FRACUNIT, vis->scale);
 	}
 
@@ -1169,6 +1168,125 @@ static void R_SplitSprite(vissprite_t *sprite, mobj_t *thing)
 	}
 }
 
+// R_GetShadowZ(thing, shadowslope)
+// Get the first visible floor below the object for shadows
+// shadowslope is filled with the floor's slope, if provided
+//
+fixed_t R_GetShadowZ(mobj_t *thing, pslope_t **shadowslope)
+{
+	boolean isflipped = thing->eflags & MFE_VERTICALFLIP;
+	fixed_t z, groundz = isflipped ? INT32_MAX : INT32_MIN;
+	pslope_t *slope, *groundslope = NULL;
+	msecnode_t *node;
+	sector_t *sector;
+	ffloor_t *rover;
+#define CHECKZ (isflipped ? z > thing->z+thing->height/2 && z < groundz : z < thing->z+thing->height/2 && z > groundz)
+
+	for (node = thing->touching_sectorlist; node; node = node->m_sectorlist_next)
+	{
+		sector = node->m_sector;
+
+		slope = sector->heightsec != -1 ? NULL : (isflipped ? sector->c_slope : sector->f_slope);
+
+		if (sector->heightsec != -1)
+			z = isflipped ? sectors[sector->heightsec].ceilingheight : sectors[sector->heightsec].floorheight;
+		else
+			z = isflipped ? P_GetSectorCeilingZAt(sector, thing->x, thing->y) : P_GetSectorFloorZAt(sector, thing->x, thing->y);
+
+		if CHECKZ
+		{
+			groundz = z;
+			groundslope = slope;
+		}
+
+		if (sector->ffloors)
+			for (rover = sector->ffloors; rover; rover = rover->next)
+			{
+				if (!(rover->flags & FF_EXISTS) || !(rover->flags & FF_RENDERPLANES) || (rover->alpha < 90 && !(rover->flags & FF_SWIMMABLE)))
+					continue;
+
+				z = isflipped ? P_GetFFloorBottomZAt(rover, thing->x, thing->y) : P_GetFFloorTopZAt(rover, thing->x, thing->y);
+				if CHECKZ
+				{
+					groundz = z;
+					groundslope = isflipped ? *rover->b_slope : *rover->t_slope;
+				}
+			}
+	}
+
+	if (isflipped ? (thing->ceilingz < groundz - (!groundslope ? 0 : FixedMul(abs(groundslope->zdelta), thing->radius*3/2)))
+		: (thing->floorz > groundz + (!groundslope ? 0 : FixedMul(abs(groundslope->zdelta), thing->radius*3/2))))
+	{
+		groundz = isflipped ? thing->ceilingz : thing->floorz;
+		groundslope = NULL;
+	}
+
+#if 0 // Unfortunately, this drops CEZ2 down to sub-17 FPS on my i7.
+	// NOTE: this section was not updated to reflect reverse gravity support
+	// Check polyobjects and see if groundz needs to be altered, for rings only because they don't update floorz
+	if (thing->type == MT_RING)
+	{
+		INT32 xl, xh, yl, yh, bx, by;
+
+		xl = (unsigned)(thing->x - thing->radius - bmaporgx)>>MAPBLOCKSHIFT;
+		xh = (unsigned)(thing->x + thing->radius - bmaporgx)>>MAPBLOCKSHIFT;
+		yl = (unsigned)(thing->y - thing->radius - bmaporgy)>>MAPBLOCKSHIFT;
+		yh = (unsigned)(thing->y + thing->radius - bmaporgy)>>MAPBLOCKSHIFT;
+
+		BMBOUNDFIX(xl, xh, yl, yh);
+
+		validcount++;
+
+		for (by = yl; by <= yh; by++)
+			for (bx = xl; bx <= xh; bx++)
+			{
+				INT32 offset;
+				polymaplink_t *plink; // haleyjd 02/22/06
+
+				if (bx < 0 || by < 0 || bx >= bmapwidth || by >= bmapheight)
+					continue;
+
+				offset = by*bmapwidth + bx;
+
+				// haleyjd 02/22/06: consider polyobject lines
+				plink = polyblocklinks[offset];
+
+				while (plink)
+				{
+					polyobj_t *po = plink->po;
+
+					if (po->validcount != validcount) // if polyobj hasn't been checked
+					{
+						po->validcount = validcount;
+
+						if (!P_MobjInsidePolyobj(po, thing) || !(po->flags & POF_RENDERPLANES))
+						{
+							plink = (polymaplink_t *)(plink->link.next);
+							continue;
+						}
+
+						// We're inside it! Yess...
+						z = po->lines[0]->backsector->ceilingheight;
+
+						if (z < thing->z+thing->height/2 && z > groundz)
+						{
+							groundz = z;
+							groundslope = NULL;
+						}
+					}
+					plink = (polymaplink_t *)(plink->link.next);
+				}
+			}
+	}
+#endif
+
+	if (shadowslope != NULL)
+		*shadowslope = groundslope;
+
+	return groundz;
+#undef CHECKZ
+}
+
 //
 // R_ProjectSprite
 // Generates a vissprite for a thing
@@ -1206,8 +1324,6 @@ static void R_ProjectSprite(mobj_t *thing)
 	fixed_t scalestep; // toast '16
 	fixed_t offset, offset2;
 	boolean papersprite = (thing->frame & FF_PAPERSPRITE);
-	fixed_t paperoffset = 0, paperdistance = 0;
-	angle_t centerangle = 0;
 
 	//SoM: 3/17/2000
 	fixed_t gz, gzt;
@@ -1637,8 +1753,6 @@ static void R_ProjectSprite(mobj_t *thing)
 		vis->startfrac += FixedDiv(vis->xiscale, this_scale) * (vis->x1 - x1);
 		vis->scale += FixedMul(scalestep, spriteyscale) * (vis->x1 - x1);
 	}
-
-	vis->thingscale = interp.scale;
 
 	//Fab: lumppat is the lump number of the patch to use, this is different
 	//     than lumpid for sprites-in-pwad : the graphics are patched

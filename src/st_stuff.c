@@ -198,6 +198,8 @@ static huddrawlist_h luahuddrawlist_game;
 // variable to stop mayonaka static from flickering
 consvar_t cv_lessflicker = {"lessflicker", "Off", CV_SAVE, CV_OnOff, NULL, 0, NULL, NULL, 0, 0, NULL};
 
+consvar_t cv_stagetitle = {"maptitle", "On", CV_SAVE, CV_OnOff, NULL, 0, NULL, NULL, 0, 0, NULL};
+
 //
 // STATUS BAR CODE
 //
@@ -237,17 +239,13 @@ void ST_doPaletteStuff(void)
 {
 	INT32 palette;
 
-	if (paused || P_AutoPause())
-		palette = 0;
-	else if (stplyr && stplyr->flashcount)
+	if (stplyr && stplyr->flashcount)
 		palette = stplyr->flashpal;
 	else
 		palette = 0;
 
-	palette = min(max(palette, 0), 13);
-
 #ifdef HWRENDER
-	if (rendermode == render_opengl && !cv_grpaletteshader.value || rendermode == render_opengl && cv_grpaletteshader.value && !cv_grflashpal.value)
+	if ((rendermode == render_opengl && !cv_grpaletteshader.value) || (rendermode == render_opengl && cv_grpaletteshader.value && !cv_grflashpal.value))
 		palette = 0; // No flashpals here in OpenGL
 #endif
 
@@ -256,7 +254,7 @@ void ST_doPaletteStuff(void)
 		st_palette = palette;
 
 #ifdef HWRENDER
-		if (rendermode != render_none && cv_grpaletteshader.value && cv_grflashpal.value)
+		if (rendermode == render_soft || (rendermode == render_opengl && cv_grpaletteshader.value && cv_grflashpal.value))
 #else
 		if (rendermode != render_none)
 #endif
@@ -826,6 +824,9 @@ static void ST_drawLevelTitle(void)
 		? BASEVIDHEIGHT/2
 		: 163;
 	INT32 lvlw;
+	
+	if (!cv_stagetitle.value)
+		return;
 
 	if (timeinmap > 113)
 		return;
@@ -2206,7 +2207,7 @@ void ST_Drawer(void)
 	//25/08/99: Hurdler: palette changes is done for all players,
 	//                   not only player1! That's why this part
 	//                   of code is moved somewhere else.
-	if (rendermode == render_soft || rendermode == render_opengl && cv_grpaletteshader.value && cv_grflashpal.value)
+	if (rendermode == render_soft || (rendermode == render_opengl && cv_grpaletteshader.value && cv_grflashpal.value))
 #endif
 	if (rendermode != render_none) ST_doPaletteStuff();
 
