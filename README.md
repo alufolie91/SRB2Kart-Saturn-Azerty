@@ -1,5 +1,8 @@
 # SRB2Kart: Saturn
 
+Discontinued - Use normal Saturn instead!
+https://github.com/Indev450/SRB2Kart-Saturn/releases
+
 [SRB2Kart](https://srb2.org/mods/) is a kart racing mod based on the 3D Sonic the Hedgehog fangame [Sonic Robo Blast 2](https://srb2.org/), based on a modified version of [Doom Legacy](http://doomlegacy.sourceforge.net/).
 
 ## Saturn Features (Take a look at the "Saturn Options" menu c;)
